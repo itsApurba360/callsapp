@@ -34,6 +34,8 @@ dependencies:
   permission_handler: ^10.3.0
   cupertino_icons: ^1.0.2
   http: ^1.2.2
+  talker_flutter: ^4.4.7
+  talker: ^4.4.7
 
 dev_dependencies:
   flutter_test:

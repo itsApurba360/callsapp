@@ -1,10 +1,12 @@
 import 'dart:convert';
 import 'dart:developer';
+import 'package:uuid/uuid.dart';
 
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
+import 'package:talker_flutter/talker_flutter.dart';
 
 void main() {
   runApp(const MyApp());
@@ -34,6 +36,7 @@ class VideoCallScreen extends StatefulWidget {
 }
 
 class _VideoCallScreenState extends State<VideoCallScreen> {
+  final talker = TalkerFlutter.init();
   final API_BASE =
       'https://rtc.live.cloudflare.com/v1/apps/f4293f4a0b5ba133aea46f942ccb4129';
   final APP_TOKEN =
@@ -48,9 +51,9 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
   @override
   void initState() {
-    // TODO: implement initState
     super.initState();
     _localRTCVideoRenderer.initialize();
+    setupPeerConnection(); // Call this here
   }
 
   @override
@@ -58,9 +61,32 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Fi'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.chat),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => TalkerScreen(talker: talker),
+                ),
+              );
+            },
+          ),
+        ],
       ),
-      body: const Center(
-        child: Text(''),
+      body: SafeArea(
+        child: Stack(
+          children: [
+            const Text('Hello'),
+            RTCVideoView(
+              _localRTCVideoRenderer,
+              objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+              mirror: true, // Mirror the local video
+              filterQuality: FilterQuality.low, // Might help with performance
+            ),
+          ],
+        ),
       ),
       floatingActionButton: FloatingActionButton(
         onPressed: () async {
@@ -74,6 +100,8 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   // / Creates a peer connection with some default settings
 
   Future setupPeerConnection() async {
+    await Permission.camera.request();
+    await Permission.microphone.request();
     Future<RTCPeerConnection> createConnection() async {
       final Map<String, dynamic> configuration = {
         'iceServers': [
@@ -87,12 +115,12 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
       // Create the peer connection
       RTCPeerConnection peerConnection =
           await createPeerConnection(configuration);
-      log('Created peer connection $peerConnection');
+      talker.verbose('Created peer connection $peerConnection');
       return peerConnection;
     }
 
-    await createCallsSession();
-    // var rtcPeerConnection = await createConnection();
+    final localSessionId = await createCallsSession();
+    var rtcPeerConnection = await createConnection();
 
     // get localStream
     _localStream = await navigator.mediaDevices.getUserMedia(
@@ -101,6 +129,70 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
         'video': true,
       },
     );
+    // set source for local video renderer
+    _localRTCVideoRenderer.srcObject = _localStream;
+    setState(() {}); // Force rebuild
+    // Next we need to push our audio and video tracks. We will add them to the peer
+    // connection using the addTransceiver API which allows us to specify the direction
+
+    final transceivers = _localStream!
+        .getTracks()
+        .map(
+          (track) => rtcPeerConnection.addTransceiver(
+            track: track,
+            init: RTCRtpTransceiverInit(
+              direction: TransceiverDirection.SendOnly,
+            ),
+          ),
+        )
+        .toList();
+
+// Now that the peer connection has tracks we create an SDP offer.
+    final localOffer = await rtcPeerConnection.createOffer();
+// And apply that offer as the local description.
+    await rtcPeerConnection.setLocalDescription(localOffer);
+    talker.verbose('Created local offer $localOffer');
+
+    final transceiversResult = await Future.wait(transceivers);
+    var uuid = const Uuid();
+    var midCounter = 0;
+    final tracks = transceiversResult.map(
+      (item) {
+        var mid = item.mid ??
+            'generated-${uuid.v4()}'; // or 'generated-${midCounter++}'
+        talker.verbose(
+            'Processing transceiver: mid=${item.mid}, trackId=${item.sender.track?.id}');
+        return {
+          "location": "local",
+          "mid": item.mid,
+          "trackName": item.sender.track?.id,
+        };
+      },
+    ).toList();
+
+    talker.verbose('Tracks to be sent: $tracks');
+    // Send the local session description to the Calls API, it will
+    // respond with an answer and trackIds.
+
+    talker.verbose('Transceivers result: ${transceiversResult.map((t) => {
+          'mid': t.mid,
+          'sender.track.id': t.sender.track?.id
+        }).toList()}');
+
+    talker.verbose('Tracks to be sent: $tracks');
+
+    final pushTracksResponse = await http.post(
+      Uri.parse('$API_BASE/sessions/$localSessionId/tracks/new'),
+      headers: headers,
+      body: jsonEncode(
+        {
+          "sessionDescription": {"sdp": localOffer.sdp, "type": "offer"},
+          "tracks": tracks,
+        },
+      ),
+    );
+
+    talker.verbose('Pushed tracks ${pushTracksResponse.body}');
   }
 
   createCallsSession() async {
@@ -110,7 +202,9 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     );
     if (sessionResponse.statusCode == 201) {
       final sessionId = jsonDecode(sessionResponse.body)['sessionId'];
-      log('Session ID: $sessionId');
+      talker.verbose('Session ID: $sessionId');
+      return sessionId;
     }
   }
 }
+
